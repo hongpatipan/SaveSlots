@@ -1,0 +1,11 @@
+name=Save Slots
+id=SaveSlots
+description=Press Esc > SAVE AS... (or F6) in game, type a name, and the current world is saved and copied to a new save you can load from Load Game. Single-player only. Requires ZombieBuddy.
+poster=poster.png
+icon=icon.png
+modversion=1.5.0
+versionMin=42.21
+require=\ZombieBuddy
+ZBVersionMin=2.3.0
+javaJarFile=media/java/client/SaveSlots.jar
+javaPkgName=saveslots
