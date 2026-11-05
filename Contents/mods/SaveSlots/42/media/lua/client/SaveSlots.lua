@@ -35,6 +35,8 @@ for count = 1, 3 do
 end
 local backupNotifyOption = options:addTickBox("autoBackupNotify", getText("UI_SaveSlots_AutoBackupNotify"), true,
     getText("UI_SaveSlots_AutoBackupNotify_tooltip"))
+local backupWarnOption = options:addTickBox("autoBackupWarn", getText("UI_SaveSlots_AutoBackupWarn"), true,
+    getText("UI_SaveSlots_AutoBackupWarn_tooltip"))
 -- A tick box as well as the path: the game does not keep an emptied text box.
 local folderOnOption = options:addTickBox("useSaveFolder", getText("UI_SaveSlots_UseFolderOption"), false,
     getText("UI_SaveSlots_UseFolderOption_tooltip"))
@@ -80,7 +82,10 @@ local folderWarned = false
 --- Tells Java where new saves go: the folder in the options, or "" for the game's Saves folder.
 local function applySaveFolder(force)
     if not SaveSlotsJava.setSaveFolder then return end
-    local wanted = folderOnOption:getValue() and tostring(folderOption:getValue() or "") or ""
+    local text = tostring(folderOption:getValue() or "")
+    -- Saves already in the folder stay usable when it is unticked.
+    if SaveSlotsJava.setLookFolder then SaveSlotsJava.setLookFolder(text) end
+    local wanted = folderOnOption:getValue() and text or ""
     if wanted == appliedFolder and not force then return end
     if wanted ~= appliedFolder then folderWarned = false end
     appliedFolder = wanted
@@ -243,6 +248,11 @@ end
 local THUMB_WAIT_TICKS = 180
 local saving = false
 
+-- Counts game sessions. A save still waiting for its picture when the player
+-- quits to the main menu is dropped, not run later in whatever game comes next.
+local gameSession = 0
+Events.OnGameStart.Add(function() gameSession = gameSession + 1 end)
+
 -- OnTick stops while the game is paused; OnTickEvenPaused keeps running.
 local tickEvent = Events.OnTickEvenPaused or Events.OnTick
 
@@ -277,15 +287,21 @@ function SaveSlots.save(name, overwrite, extraInfo, resumeSpeed, quiet)
     saving = true
     applySaveFolder()
     local player = getPlayer()
+    local session = gameSession
     local stampBefore = SaveSlotsJava.thumbStamp and SaveSlotsJava.thumbStamp() or nil
     saveGame()
     local info = collectInfo()
     if extraInfo then info = info .. "|" .. extraInfo end
 
     local ticks = 0
+    --- The player quit (or a new game started) while waiting: nothing to copy.
+    local function gone()
+        return gameSession ~= session or getPlayer() ~= player
+    end
     local function finish()
         tickEvent.Remove(finish)
         saving = false
+        if gone() then return end
         local ok, result = pcall(SaveSlotsJava.saveSlot, name, overwrite == true, info)
         resumeGame(resumeSpeed)
         if ok and result and result:sub(1, 3) == "OK:" then
@@ -301,6 +317,11 @@ function SaveSlots.save(name, overwrite, extraInfo, resumeSpeed, quiet)
         end
     end
     local function waitForThumb()
+        if gone() then
+            tickEvent.Remove(waitForThumb)
+            saving = false
+            return
+        end
         ticks = ticks + 1
         if stampBefore ~= nil and ticks < THUMB_WAIT_TICKS and SaveSlotsJava.thumbStamp() == stampBefore then
             return
@@ -385,20 +406,13 @@ function SaveSlots.continueSave(gameMode, saveName)
     return originalContinue(gameMode, saveName)
 end
 
-MainScreen.continueLatestSave = function(gameMode, saveName)
-    local slot = ""
-    if javaReady() and SaveSlotsJava.slotOf and gameMode and saveName then
-        slot = SaveSlotsJava.slotOf(gameMode .. "/" .. saveName)
-    end
-    if slot == "" or not MainScreen.instance then
-        return SaveSlots.continueSave(gameMode, saveName)
-    end
-    -- Opened from the game's own menus: replacing the main world needs a yes.
+--- Asks before a slot replaces the main world from the game's own menus.
+local function confirmMenuLoad(slot, onYes)
     local text = getText("UI_SaveSlots_ConfirmLoad", slot)
     local modal = ISModalDialog:new(0, 0, 300, 120, text, true, nil, function(_, button)
         MainScreen.instance.checkSavefileModal = nil
         if button.internal == "YES" then
-            SaveSlots.continueSave(gameMode, saveName)
+            onYes()
         else
             MainScreen.instance.bottomPanel:setVisible(true)
         end
@@ -410,6 +424,43 @@ MainScreen.continueLatestSave = function(gameMode, saveName)
     modal:setAlwaysOnTop(true)
     MainScreen.instance.checkSavefileModal = modal
 end
+
+MainScreen.continueLatestSave = function(gameMode, saveName)
+    local slot = ""
+    if javaReady() and SaveSlotsJava.slotOf and gameMode and saveName then
+        slot = SaveSlotsJava.slotOf(gameMode .. "/" .. saveName)
+    end
+    if slot == "" or not MainScreen.instance then
+        return SaveSlots.continueSave(gameMode, saveName)
+    end
+    -- Opened from the game's own menus: replacing the main world needs a yes.
+    confirmMenuLoad(slot, function() SaveSlots.continueSave(gameMode, saveName) end)
+end
+
+----------------------------------------------------------------------------
+-- Load Game: the game only lists saves in its Saves folder. Saves kept in
+-- the chosen folder get a link there (SaveSlotsApi.syncLinks), so they show
+-- and work like any save: details, picture, mods, Delete and More.
+----------------------------------------------------------------------------
+
+require "OptionScreens/LoadGameScreen"
+
+local function syncLinks()
+    if not (javaReady() and SaveSlotsJava.syncLinks) then return end
+    applySaveFolder(true)
+    local ok, result = pcall(SaveSlotsJava.syncLinks)
+    if not ok or (result and result:sub(1, 3) ~= "OK:") then
+        print("[SaveSlots] Linking saves for Load Game failed: " .. tostring(result))
+    end
+end
+
+local originalSetSaveGamesList = LoadGameScreen.setSaveGamesList
+function LoadGameScreen:setSaveGamesList()
+    syncLinks()
+    return originalSetSaveGamesList(self)
+end
+
+Events.OnMainMenuEnter.Add(syncLinks)
 
 ----------------------------------------------------------------------------
 -- Sleep Save: falling asleep overwrites the "Sleep Save" slot.
@@ -495,22 +546,74 @@ end
 -- stops while paused), and a long gap between ticks (alt-tab, loading) is not.
 local backupElapsedMs = 0
 local lastTickMs = nil
+local warnedAt = {}
 Events.OnGameStart.Add(function()
     backupElapsedMs = 0
     lastTickMs = nil
+    warnedAt = {}
 end)
 
---- Not in the middle of something: no zombies on you, not asleep, not driving fast.
-local function safeToBackup(player)
+-- An Auto Backup is taken while the game is paused (Esc menu or the pause
+-- key), when nobody notices the short stop: from a minute before it is due.
+-- If the player does not pause within 3 minutes after it is due, it is taken
+-- while playing, after a 30 and 10 second warning and once no zombie is near.
+local EARLY_MS = 60000
+local WAIT_MS = 3 * 60000
+local WARN_SECONDS = { 30, 10 }
+-- Zombies this close (tiles, same floor) hold a backup while playing, unless
+-- it is this long overdue (a zombie stuck outside the base must not stop it).
+local ZOMBIE_RADIUS = 12
+local OVERDUE_MS = 5 * 60000
+local SAFE_CHECK_MS = 1000
+
+local function zombieNear(player, radius)
+    local cell = getCell()
+    local list = cell and cell:getZombieList()
+    if not list then return false end
+    local px, py, pz = player:getX(), player:getY(), player:getZ()
+    local r2 = radius * radius
+    for i = 0, list:size() - 1 do
+        local zombie = list:get(i)
+        if zombie and not zombie:isDead() and math.abs(zombie:getZ() - pz) < 1 then
+            local dx, dy = zombie:getX() - px, zombie:getY() - py
+            if dx * dx + dy * dy <= r2 then return true end
+        end
+    end
+    return false
+end
+
+--- Not in the middle of something: no zombies on you or nearby, not asleep, not driving fast.
+local function safeToBackup(player, overdue)
     if not player or player:isDead() or player:isAsleep() then return false end
     if SaveSlots.dialog then return false end
     local stats = player:getStats()
     if stats:getNumChasingZombies() > 0 or stats:getNumVeryCloseZombies() > 0 then return false end
+    if not overdue and zombieNear(player, ZOMBIE_RADIUS) then return false end
     local vehicle = player:getVehicle()
     if vehicle and math.abs(vehicle:getCurrentSpeedKmHour()) > 5 then return false end
     return true
 end
 
+--- "Auto Backup in 30 s" above the character, once per step.
+local function warnBackup(player, msLeft)
+    if not (player and backupWarnOption:getValue()) then return end
+    for _, seconds in ipairs(WARN_SECONDS) do
+        if msLeft <= seconds * 1000 and msLeft > (seconds - 5) * 1000 and not warnedAt[seconds] then
+            warnedAt[seconds] = true
+            HaloTextHelper.addText(player, getText("UI_SaveSlots_BackupSoon", seconds))
+        end
+    end
+end
+
+local function runBackup()
+    backupElapsedMs = 0
+    warnedAt = {}
+    local ok, err = pcall(SaveSlots.autoBackup)
+    if not ok then print("[SaveSlots] Auto Backup failed: " .. tostring(err)) end
+end
+
+-- While playing: count play time, and take an overdue backup at a safe moment.
+local lastSafeCheckMs = 0
 local function onBackupTick()
     local now = getTimestampMs()
     if lastTickMs then
@@ -519,15 +622,30 @@ local function onBackupTick()
     end
     lastTickMs = now
     local interval = backupIntervalMs()
-    if interval <= 0 or backupElapsedMs < interval or saving then return end
+    if interval <= 0 or saving then return end
     local player = getPlayer()
-    -- Not now: try again on the next tick, so it happens as soon as it is safe.
-    if not safeToBackup(player) then return end
-    backupElapsedMs = 0
-    local ok, err = pcall(SaveSlots.autoBackup)
-    if not ok then print("[SaveSlots] Auto Backup failed: " .. tostring(err)) end
+    local deadline = interval + WAIT_MS
+    if backupElapsedMs < deadline then
+        warnBackup(player, deadline - backupElapsedMs)
+        return
+    end
+    -- Not now: check again every second, so it happens as soon as it is safe.
+    if now - lastSafeCheckMs < SAFE_CHECK_MS then return end
+    lastSafeCheckMs = now
+    if safeToBackup(player, backupElapsedMs - deadline > OVERDUE_MS) then runBackup() end
 end
 Events.OnTick.Add(onBackupTick)
+
+-- While paused: the best moment, nobody notices the stop.
+local function onPausedBackupTick()
+    if saving or not isGamePaused() or SaveSlots.dialog then return end
+    local interval = backupIntervalMs()
+    if interval <= 0 or backupElapsedMs < interval - EARLY_MS then return end
+    local player = getPlayer()
+    if not player or player:isDead() then return end
+    runBackup()
+end
+if Events.OnTickEvenPaused then Events.OnTickEvenPaused.Add(onPausedBackupTick) end
 
 --- Minutes of play left until the next backup, or nil when Auto Backup is off.
 local function minutesToNextBackup()
@@ -621,6 +739,8 @@ end
 function SaveSlotsDialog:refreshList()
     local selectedName = self:selectedSlot() and self:selectedSlot().name
     self.list:clear()
+    -- Slots in the save folder show their picture through their link in Saves.
+    syncLinks()
     self.slots = readSlots()
     self.folderText, self.folderBad = saveFolderText()
     self.totalSize, self.slotCount, self.autoSize = 0, 0, 0

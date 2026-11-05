@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
@@ -15,6 +16,7 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -24,6 +26,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import me.zed_0xff.zombie_buddy.Exposer;
@@ -85,6 +88,9 @@ public class SaveSlotsApi {
     // The save folder chosen in the options (null: the game's Saves folder),
     // and why it is not used when it cannot be.
     private static Path saveFolder = null;
+    // The folder typed in the options even while it is not ticked, so saves
+    // already there can still be listed, loaded, renamed and deleted.
+    private static Path lookFolder = null;
     private static String saveFolderError = "";
 
     // Old copies are deleted on a low-priority thread so the game does not
@@ -119,7 +125,7 @@ public class SaveSlotsApi {
      */
     public static String listSlots() {
         Path current = currentSave();
-        return current == null ? "" : listSlotsAt(current, usableSaveFolder());
+        return current == null ? "" : listSlotsAt(current, knownFolder());
     }
 
     static String listSlotsAt(Path current) {
@@ -179,18 +185,9 @@ public class SaveSlotsApi {
      * when overwrite is true. info ("key=value|...") is stored with the slot.
      */
     public static String saveSlot(String slotName, boolean overwrite, String info) {
-        if (!isAvailable()) {
-            return "ERR:multiplayer";
-        }
-        if (Core.getInstance().isNoSave()) {
-            return "ERR:nosave";
-        }
-        Path current = currentSave();
-        if (current == null) {
-            return "ERR:no_save";
-        }
-        if (!flushChunks()) {
-            return "ERR:chunks_busy";
+        String problem = checkCanSave();
+        if (problem != null) {
+            return problem;
         }
         Path work;
         try {
@@ -198,7 +195,24 @@ public class SaveSlotsApi {
         } catch (IOException e) {
             return "ERR:io:" + e.getMessage();
         }
-        return saveSlotAt(current, usableSaveFolder(), work, slotName, overwrite, info);
+        return saveSlotAt(currentSave(), usableSaveFolder(), knownFolder(), work, slotName, overwrite, info);
+    }
+
+    /** null if the world being played can be saved into a slot now, otherwise the error. */
+    private static String checkCanSave() {
+        if (!isAvailable()) {
+            return "ERR:multiplayer";
+        }
+        if (Core.getInstance().isNoSave()) {
+            return "ERR:nosave";
+        }
+        if (currentSave() == null) {
+            return "ERR:no_save";
+        }
+        if (!flushChunks()) {
+            return "ERR:chunks_busy";
+        }
+        return null;
     }
 
     static String saveSlotAt(Path current, Path work, String slotName, boolean overwrite, String info) {
@@ -211,6 +225,12 @@ public class SaveSlotsApi {
      * work is the work folder next to Saves.
      */
     static String saveSlotAt(Path current, Path folder, Path work, String slotName, boolean overwrite, String info) {
+        return saveSlotAt(current, folder, folder, work, slotName, overwrite, info);
+    }
+
+    /** look: where existing slots are looked for besides Saves (the unticked folder too). */
+    static String saveSlotAt(Path current, Path folder, Path look, Path work, String slotName, boolean overwrite,
+            String info) {
         String clean = sanitize(slotName);
         if (clean.isEmpty()) {
             return "ERR:empty_name";
@@ -234,7 +254,7 @@ public class SaveSlotsApi {
             return "ERR:foreign:" + target.getFileName();
         }
         // The slot as it is now, in the chosen folder or still in Saves.
-        Path existing = findSlot(current, folder, base, clean);
+        Path existing = findSlot(current, look != null ? look : folder, base, clean);
         if (existing != null && !overwrite) {
             return "ERR:exists:" + clean;
         }
@@ -255,7 +275,8 @@ public class SaveSlotsApi {
         try {
             // Files unchanged since the previous copy of this slot are linked
             // to it instead of copied. That copy is deleted right after the
-            // swap, so no file stays shared between two saves.
+            // swap, so no file stays shared between two saves: a save opened
+            // without the mod is written in place and must not change another.
             CopyStats stats = copyRecursively(current, fresh, existing != null && canLink(existing) ? existing : null);
             writeMarkerOrThrow(fresh, base);
             writeInfo(fresh, info, stats.bytes);
@@ -279,6 +300,10 @@ public class SaveSlotsApi {
                 }
                 discard(targetWork, old);
             } else {
+                // The game menu's link to a copy elsewhere: the new copy takes its place.
+                if (isLink(target)) {
+                    Files.delete(target);
+                }
                 Files.move(fresh, target, StandardCopyOption.ATOMIC_MOVE);
             }
         } catch (IOException e) {
@@ -287,9 +312,10 @@ public class SaveSlotsApi {
             return "ERR:io:" + e.getMessage();
         }
         if (existing != null && !existing.equals(target)) {
-            // It was still in Saves: the new copy is in the chosen folder now.
+            // It was in the other place (Saves or the save folder): the new copy replaces it.
             try {
-                trash(existing, work);
+                Path folderOfExisting = look != null && existing.startsWith(look) ? look : null;
+                trash(existing, folderOfExisting != null ? prepareWorkDir(folderOfExisting.resolve(FOLDER_WORK)) : work);
             } catch (IOException e) {
                 System.out.println("[SaveSlots] Could not remove the previous copy " + existing + ": " + e);
             }
@@ -305,7 +331,7 @@ public class SaveSlotsApi {
             return "ERR:multiplayer";
         }
         Path current = currentSave();
-        return current == null ? "ERR:no_save" : renameSlotAt(current, usableSaveFolder(), oldName, newName);
+        return current == null ? "ERR:no_save" : renameSlotAt(current, knownFolder(), oldName, newName);
     }
 
     static String renameSlotAt(Path current, String oldName, String newName) {
@@ -362,7 +388,7 @@ public class SaveSlotsApi {
             return "ERR:no_save";
         }
         try {
-            return deleteSlotAt(current, usableSaveFolder(), workDir(), slotName);
+            return deleteSlotAt(current, knownFolder(), workDir(), slotName);
         } catch (IOException e) {
             return "ERR:io:" + e.getMessage();
         }
@@ -400,7 +426,10 @@ public class SaveSlotsApi {
         if (save == null) {
             return null;
         }
-        String path = save.resolve("thumb.png").toString();
+        // The game's picture loader does not open files from another drive,
+        // but it does through the slot's link in Saves (as Load Game shows).
+        Path link = linkOf(relativeSave, save);
+        String path = (link != null ? link : save).resolve("thumb.png").toString();
         File file = new File(path);
         if (!file.isFile()) {
             return null;
@@ -492,20 +521,209 @@ public class SaveSlotsApi {
         return name == null ? "" : name;
     }
 
-    /** "Sandbox\folder" in Saves, or "@Sandbox\folder" in the chosen save folder; null if not usable. */
+    /**
+     * "Sandbox\folder" in Saves, or "@Sandbox\folder" in the save folder; null
+     * if not usable. A link in Saves (see syncLinks) gives the slot it points to.
+     */
     private static Path savePath(String relativeSave) {
         if (relativeSave == null || relativeSave.isEmpty() || relativeSave.contains("..")) {
             return null;
         }
+        Path path;
         if (relativeSave.startsWith(FOLDER_PREFIX)) {
-            Path folder = saveFolder;
+            Path folder = knownFolder();
             if (folder == null) {
                 return null;
             }
-            Path path = folder.resolve(relativeSave.substring(FOLDER_PREFIX.length())).normalize();
-            return path.startsWith(folder) ? path : null;
+            path = folder.resolve(relativeSave.substring(FOLDER_PREFIX.length())).normalize();
+            if (!path.startsWith(folder)) {
+                return null;
+            }
+        } else {
+            path = new File(ZomboidFileSystem.instance.getSaveDirSub(relativeSave)).toPath().toAbsolutePath().normalize();
         }
-        return new File(ZomboidFileSystem.instance.getSaveDirSub(relativeSave)).toPath().toAbsolutePath().normalize();
+        return realPath(path);
+    }
+
+    /** The link in Saves for a slot in the save folder ("@Sandbox\folder"), or null if it has none. */
+    private static Path linkOf(String relativeSave, Path slot) {
+        Path saves = savesDir();
+        if (saves == null || relativeSave == null || !relativeSave.startsWith(FOLDER_PREFIX)) {
+            return null;
+        }
+        Path link = saves.resolve(relativeSave.substring(FOLDER_PREFIX.length())).normalize();
+        if (!link.startsWith(saves) || !isLink(link)) {
+            return null;
+        }
+        try {
+            return link.toRealPath().equals(slot.toRealPath()) ? link : null;
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** The folder itself if it is not a link, the folder it points to if it is. */
+    private static Path realPath(Path path) {
+        if (!isLink(path)) {
+            return path;
+        }
+        try {
+            return path.toRealPath();
+        } catch (IOException e) {
+            return path;
+        }
+    }
+
+    /** True for a symbolic link or Windows junction (not followed). */
+    static boolean isLink(Path path) {
+        try {
+            BasicFileAttributes attrs = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            return attrs.isSymbolicLink() || attrs.isOther();
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Makes every slot in the save folder show in the game's own Load Game
+     * list, which only reads Saves: each gets a link (a junction on Windows)
+     * in Saves\<game mode> with the slot's folder name. The game then reads,
+     * changes mods of and deletes it like any save, in its real place.
+     * Links whose slot is gone are removed, and so are empty folders the
+     * game's Delete leaves in the save folder. Real folders are never touched.
+     */
+    public static String syncLinks() {
+        Path folder = knownFolder();
+        Path saves = savesDir();
+        if (folder == null || saves == null || !isAvailable()) {
+            return "OK:0";
+        }
+        return syncLinksAt(folder, saves);
+    }
+
+    static String syncLinksAt(Path folder, Path saves) {
+        int made = 0;
+        Path realFolder;
+        try {
+            realFolder = folder.toRealPath();
+        } catch (IOException e) {
+            return "ERR:io:" + e.getMessage();
+        }
+        Set<Path> linked = new HashSet<>();
+        // Links in Saves: drop the ones whose slot is gone, note the rest.
+        try (DirectoryStream<Path> modes = Files.newDirectoryStream(saves, Files::isDirectory)) {
+            for (Path mode : modes) {
+                try (DirectoryStream<Path> dirs = Files.newDirectoryStream(mode)) {
+                    for (Path link : dirs) {
+                        if (!isLink(link)) {
+                            continue;
+                        }
+                        Path real = null;
+                        try {
+                            real = link.toRealPath();
+                        } catch (IOException e) {
+                            // Points nowhere: slot deleted or renamed, or its drive is unplugged
+                            // (made again when it is back).
+                        }
+                        if (real == null) {
+                            if (link.getFileName().toString().contains(SEPARATOR)) {
+                                deleteLink(link);
+                            }
+                        } else if (real.startsWith(realFolder)) {
+                            if (readMarker(real) == null) {
+                                deleteLink(link);
+                            } else {
+                                linked.add(real);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (IOException e) {
+            System.out.println("[SaveSlots] Checking links in Saves failed: " + e);
+        }
+        // Slots in the save folder without a link get one.
+        try (DirectoryStream<Path> modes = Files.newDirectoryStream(realFolder, Files::isDirectory)) {
+            for (Path mode : modes) {
+                if (mode.getFileName().toString().equals(FOLDER_WORK) || hidden(mode) || isLink(mode)) {
+                    continue;
+                }
+                try (DirectoryStream<Path> dirs = Files.newDirectoryStream(mode)) {
+                    for (Path dir : dirs) {
+                        if (isLink(dir) || !Files.isDirectory(dir)) {
+                            continue;
+                        }
+                        String base = readMarker(dir);
+                        if (base == null || slotNameOf(dir, base) == null) {
+                            // Emptied by the game's Delete, which only removes the link and the files.
+                            if (isEmptyDir(dir)) {
+                                deleteLink(dir);
+                            }
+                            continue;
+                        }
+                        if (linked.contains(dir)) {
+                            continue;
+                        }
+                        Path link = saves.resolve(mode.getFileName().toString()).resolve(dir.getFileName().toString());
+                        if (Files.exists(link, LinkOption.NOFOLLOW_LINKS)) {
+                            continue;   // a save of that name is in Saves already
+                        }
+                        Files.createDirectories(link.getParent());
+                        if (makeLink(link, dir)) {
+                            made++;
+                        }
+                    }
+                }
+            }
+        } catch (IOException e) {
+            System.out.println("[SaveSlots] Linking saves failed: " + e);
+            return "ERR:io:" + e.getMessage();
+        }
+        if (made > 0) {
+            System.out.println("[SaveSlots] Linked " + made + " saves from " + realFolder + " into " + saves);
+        }
+        return "OK:" + made;
+    }
+
+    private static boolean isEmptyDir(Path dir) {
+        try (DirectoryStream<Path> entries = Files.newDirectoryStream(dir)) {
+            return !entries.iterator().hasNext();
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /** Removes a link (never what it points to) or an empty folder. */
+    private static void deleteLink(Path path) {
+        try {
+            Files.delete(path);
+        } catch (IOException e) {
+            System.out.println("[SaveSlots] Could not remove " + path + ": " + e);
+        }
+    }
+
+    /** A junction on Windows (needs no admin rights), a symbolic link elsewhere. */
+    private static boolean makeLink(Path link, Path target) {
+        try {
+            if (File.separatorChar == '\\') {
+                Process p = new ProcessBuilder("cmd.exe", "/c", "mklink", "/J", link.toString(), target.toString())
+                        .redirectErrorStream(true).start();
+                String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+                if (!p.waitFor(10, TimeUnit.SECONDS) || p.exitValue() != 0 || !Files.isDirectory(link)) {
+                    System.out.println("[SaveSlots] Could not link " + link + ": " + out);
+                    return false;
+                }
+            } else {
+                Files.createSymbolicLink(link, target);
+            }
+            return true;
+        } catch (IOException | RuntimeException e) {
+            System.out.println("[SaveSlots] Could not link " + link + ": " + e);
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     static String restoreSlotAt(Path slot, Path work) {
@@ -617,7 +835,7 @@ public class SaveSlotsApi {
         Path found = null;
         for (Path parent : slotParents(current, folder)) {
             Path dir = parent.resolve(base + SEPARATOR + slotName).normalize();
-            if (dir.getParent().equals(parent) && Files.isDirectory(dir) && slotNameOf(dir, base) != null) {
+            if (dir.getParent().equals(parent) && Files.isDirectory(dir) && !isLink(dir) && slotNameOf(dir, base) != null) {
                 found = dir;
             }
         }
@@ -631,7 +849,8 @@ public class SaveSlotsApi {
             if (!Files.isDirectory(parent)) {
                 continue;
             }
-            try (DirectoryStream<Path> dirs = Files.newDirectoryStream(parent, Files::isDirectory)) {
+            // Links are only there for the game's menu (see syncLinks); the slot itself is in the save folder.
+            try (DirectoryStream<Path> dirs = Files.newDirectoryStream(parent, d -> Files.isDirectory(d) && !isLink(d))) {
                 for (Path dir : dirs) {
                     String slot = slotNameOf(dir, base);
                     if (slot != null) {
@@ -782,6 +1001,40 @@ public class SaveSlotsApi {
     private static Path usableSaveFolder() {
         Path folder = saveFolder;
         return folder != null && Files.isDirectory(folder) ? folder : null;
+    }
+
+    /**
+     * The folder in the options, ticked or not ("" for none). Saves already
+     * there stay usable after unticking; new saves then go to Saves.
+     */
+    public static String setLookFolder(String folder) {
+        String text = folder == null ? "" : folder.trim();
+        if (text.length() >= 2 && text.startsWith("\"") && text.endsWith("\"")) {
+            text = text.substring(1, text.length() - 1).trim();
+        }
+        lookFolder = null;
+        try {
+            Path dir = text.isEmpty() ? null : Path.of(text);
+            if (dir != null && dir.isAbsolute()) {
+                lookFolder = dir.normalize();
+            }
+        } catch (RuntimeException e) {
+            // Not a path: nothing to look in.
+        }
+        return lookFolder == null ? "" : lookFolder.toString();
+    }
+
+    /** Where existing saves are looked for: the chosen folder, or the unticked one. */
+    private static Path knownFolder() {
+        Path folder = usableSaveFolder();
+        if (folder == null) {
+            folder = lookFolder;
+        }
+        if (folder == null || !Files.isDirectory(folder)) {
+            return null;
+        }
+        Path saves = savesDir();
+        return saves != null && folder.startsWith(saves) ? null : folder;
     }
 
     /** Checks a folder typed by the player and creates it. "OK:<folder>" or "ERR:<reason>:<text>". */
