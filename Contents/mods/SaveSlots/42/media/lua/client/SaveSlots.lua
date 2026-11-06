@@ -37,6 +37,9 @@ local backupNotifyOption = options:addTickBox("autoBackupNotify", getText("UI_Sa
     getText("UI_SaveSlots_AutoBackupNotify_tooltip"))
 local backupWarnOption = options:addTickBox("autoBackupWarn", getText("UI_SaveSlots_AutoBackupWarn"), true,
     getText("UI_SaveSlots_AutoBackupWarn_tooltip"))
+-- Copies the world in the background while playing (experimental, off until it has proved itself).
+local smoothOption = options:addTickBox("smoothSave", getText("UI_SaveSlots_SmoothOption"), false,
+    getText("UI_SaveSlots_SmoothOption_tooltip"))
 -- A tick box as well as the path: the game does not keep an emptied text box.
 local folderOnOption = options:addTickBox("useSaveFolder", getText("UI_SaveSlots_UseFolderOption"), false,
     getText("UI_SaveSlots_UseFolderOption_tooltip"))
@@ -67,6 +70,167 @@ local function say(player, text, good)
         HaloTextHelper.addGoodText(player, text)
     else
         HaloTextHelper.addBadText(player, text)
+    end
+end
+
+----------------------------------------------------------------------------
+-- Status bar at the bottom of the screen: the countdown before an Auto Backup,
+-- "Saving...", "Saved" and errors. Replaces text above the character's head.
+-- The game hides every UI element while the Esc menu is open, and shows it
+-- again afterwards, so the bar hides itself whenever it has nothing to say.
+----------------------------------------------------------------------------
+
+SaveSlotsHud = ISPanel:derive("SaveSlotsHud")
+
+local HUD_COLORS = {
+    warn   = { 0.95, 0.75, 0.25 },
+    saving = { 0.55, 0.75, 0.95 },
+    done   = { 0.45, 0.85, 0.50 },
+    error  = { 0.90, 0.35, 0.30 },
+}
+local HUD_BAR_HGT = 4
+
+-- The game's own picture of Spiffo the builder (referenced, not copied), shown
+-- beside the bar. It is a still picture, so it is moved in code: the hammer is
+-- raised slowly and brought down fast, once every 0.7 seconds, while saving.
+local MASCOT_FILE = "media/ui/spiffoBuilder.png"
+local MASCOT_HGT = 44
+local mascotTexture = nil
+
+local function mascot()
+    if mascotTexture == nil then
+        mascotTexture = getTexture(MASCOT_FILE) or false
+    end
+    return mascotTexture or nil
+end
+
+function SaveSlotsHud:new()
+    local o = ISPanel.new(self, 0, 0, 100, mascot() and (MASCOT_HGT + 12) or (FONT_HGT_SMALL + 20))
+    o.backgroundColor = { r = 0, g = 0, b = 0, a = 0.72 }
+    o.borderColor = { r = 0.5, g = 0.5, b = 0.5, a = 0.8 }
+    o.moveWithMouse = false
+    return o
+end
+
+--- Height of the picture at this moment: up to 6 pixels up, and a little flatter when it comes down.
+local hudClock = nil
+
+--- Where we are in a repeating cycle, 0 to under 1. The time is counted from when
+--- the bar was first used: `getTimestampMs() % period` on the game's own clock gave
+--- nonsense (the picture ended up billions of pixels off the screen).
+local function phase(period)
+    local now = getTimestampMs()
+    if hudClock == nil then hudClock = now end
+    local t = now - hudClock
+    local p = (t - math.floor(t / period) * period) / period
+    if p ~= p or p < 0 or p >= 1 then return 0 end
+    return p
+end
+
+local function mascotBeat(kind)
+    if kind == "done" then return 0, 1 end
+    local p = phase(kind == "warn" and 1400 or 700)
+    if p < 0.7 then
+        return -6 * (p / 0.7), 1                     -- raising
+    end
+    local down = (p - 0.7) / 0.3                     -- coming down fast, then a squash on the hit
+    return -6 * (1 - down), 1 - 0.08 * math.sin(down * math.pi)
+end
+
+--- The text cut to fit the width, with "..." when it had to be shortened.
+local function fitText(text, maxWidth)
+    local tm = getTextManager()
+    if tm:MeasureStringX(UIFont.Small, text) <= maxWidth then return text end
+    while #text > 1 and tm:MeasureStringX(UIFont.Small, text .. "...") > maxWidth do
+        text = text:sub(1, #text - 1)
+    end
+    return text .. "..."
+end
+
+function SaveSlotsHud:prerender()
+    if not self.kind then
+        self:setVisible(false)
+        return
+    end
+    if self.hideAt and getTimestampMs() >= self.hideAt then
+        self.kind = nil
+        self:setVisible(false)
+        return
+    end
+    ISPanel.prerender(self)
+    local c = HUD_COLORS[self.kind]
+    local barY = self.height - HUD_BAR_HGT - 4
+    -- Room for the picture on the left (not for errors).
+    local left = PAD
+    local tex = self.kind ~= "error" and mascot() or nil
+    if tex then
+        local h = MASCOT_HGT
+        local w = math.floor(h * tex:getWidth() / math.max(1, tex:getHeight()))
+        local lift, squash = mascotBeat(self.kind)
+        -- Whole pixels: the picture was seen only while it stood still (fractions are suspect).
+        local drawH = math.floor(h * squash + 0.5)
+        local y = math.floor((self.height - h) / 2 + lift + (h - drawH) + 0.5)
+        y = math.max(0, math.min(self.height - 1, y))   -- never off the bar
+        self:drawTextureScaled(tex, PAD, y, w, drawH, 1, 1, 1, 1)
+        left = PAD + w + PAD
+    end
+    local barW = self.width - left - PAD
+    local percent = self.fraction and self.kind ~= "warn"
+            and string.format("%d%%", math.floor(self.fraction * 100 + 0.5)) or nil
+    local textW = barW - (percent and 50 or 0)
+    local textY = math.floor((barY - FONT_HGT_SMALL) / 2)
+    self:drawText(fitText(self.label or "", textW), left, textY, 1, 1, 1, 1, UIFont.Small)
+    if percent then
+        self:drawTextRight(percent, self.width - PAD, textY, 0.8, 0.8, 0.8, 1, UIFont.Small)
+    end
+    self:drawRect(left, barY, barW, HUD_BAR_HGT, 0.5, 0.2, 0.2, 0.2)
+    if self.fraction then
+        local w = math.max(0, math.min(1, self.fraction)) * barW
+        self:drawRect(left, barY, w, HUD_BAR_HGT, 1, c[1], c[2], c[3])
+    else
+        -- No known progress: a block that slides along the bar.
+        local blockW = barW * 0.25
+        local t = phase(1200)
+        local x0 = math.max(0, t * (barW + blockW) - blockW)
+        local x1 = math.min(barW, t * (barW + blockW))
+        if x1 > x0 then
+            self:drawRect(left + x0, barY, x1 - x0, HUD_BAR_HGT, 1, c[1], c[2], c[3])
+        end
+    end
+end
+
+local hud = nil
+
+--- Shows the bar. kind: "warn", "saving", "done" or "error".
+--- fraction: 0 to 1, or nil when the progress is not known.
+--- holdMs: hide itself after this long (nil: stays until replaced or hidden).
+local function hudShow(kind, label, fraction, holdMs)
+    if not hud then
+        hud = SaveSlotsHud:new()
+        hud:initialise()
+        hud:instantiate()
+        hud:addToUIManager()
+        hud:setAlwaysOnTop(true)
+        -- Clicks go through to the game below.
+        hud.javaObject:setConsumeMouseEvents(false)
+    end
+    local sw, sh = getCore():getScreenWidth(), getCore():getScreenHeight()
+    if hud.screenW ~= sw or hud.screenH ~= sh then
+        hud.screenW, hud.screenH = sw, sh
+        hud:setWidth(math.min(520, math.floor(sw * 0.6)))
+        hud:setX(math.floor((sw - hud.width) / 2))
+        hud:setY(sh - hud.height - 110)
+    end
+    hud.kind, hud.label, hud.fraction = kind, label, fraction
+    hud.hideAt = holdMs and (getTimestampMs() + holdMs) or nil
+    hud:setVisible(true)
+end
+
+--- Hides the bar, but only if it is showing this kind (not a newer message).
+local function hudHide(kind)
+    if hud and hud.kind and (kind == nil or hud.kind == kind) then
+        hud.kind = nil
+        hud:setVisible(false)
     end
 end
 
@@ -246,6 +410,10 @@ end
 -- or more after saveGame(). Copying before that would give the slot the
 -- picture of the previous save, so wait for it (at most about 3 seconds).
 local THUMB_WAIT_TICKS = 180
+-- Before saving, the status bar is shown for at least this many frames and
+-- milliseconds, so it is on screen while the game is stopped.
+local BAR_FRAMES = 3
+local BAR_MS = 120
 local saving = false
 
 -- Counts game sessions. A save still waiting for its picture when the player
@@ -279,6 +447,11 @@ end
 --- Saves the game, then copies it into the slot once the new picture is written.
 --- resumeSpeed: the speed to restore when done (the game stays paused until then).
 --- quiet: no message when it worked (errors are always shown).
+---
+--- Two ways to copy. Plain: the game stops while the whole world is copied.
+--- Smooth (option, experimental): the world is copied in the background while
+--- the game runs and the bar shows the progress; then the game stops for a
+--- moment only to copy what changed meanwhile (see SaveSlotsApi).
 function SaveSlots.save(name, overwrite, extraInfo, resumeSpeed, quiet)
     if saving then
         resumeGame(resumeSpeed)
@@ -288,49 +461,187 @@ function SaveSlots.save(name, overwrite, extraInfo, resumeSpeed, quiet)
     applySaveFolder()
     local player = getPlayer()
     local session = gameSession
-    local stampBefore = SaveSlotsJava.thumbStamp and SaveSlotsJava.thumbStamp() or nil
-    saveGame()
-    local info = collectInfo()
-    if extraInfo then info = info .. "|" .. extraInfo end
+    local smooth = smoothOption:getValue() and SaveSlotsJava.beginPrecopy ~= nil
+    local info
 
-    local ticks = 0
+    -- For the log: how long the game stood still while saving.
+    local startedAt, saveGameMs = getTimestampMs(), 0
+    local gapLast, gapMax, gapSlow = nil, 0, 0
+    local function meterTick()
+        local now = getTimestampMs()
+        if gapLast then
+            local gap = now - gapLast
+            if gap > gapMax then gapMax = gap end
+            if gap > 50 then gapSlow = gapSlow + 1 end
+        end
+        gapLast = now
+    end
+    local function stopMeter()
+        tickEvent.Remove(meterTick)
+    end
+
     --- The player quit (or a new game started) while waiting: nothing to copy.
     local function gone()
         return gameSession ~= session or getPlayer() ~= player
     end
-    local function finish()
-        tickEvent.Remove(finish)
+    local function abandon()
+        stopMeter()
         saving = false
-        if gone() then return end
-        local ok, result = pcall(SaveSlotsJava.saveSlot, name, overwrite == true, info)
+        hudHide()
+        if SaveSlotsJava.cancelPrecopy then pcall(SaveSlotsJava.cancelPrecopy) end
+    end
+
+    --- The slot is made, or it failed: say how it went.
+    local function report(ok, result)
+        stopMeter()
+        print("[SaveSlots] while saving: longest wait between frames " .. math.floor(gapMax) .. " ms, "
+                .. gapSlow .. " waits over 50 ms, saveGame() took " .. math.floor(saveGameMs) .. " ms, all of it "
+                .. math.floor(getTimestampMs() - startedAt) .. " ms")
+        saving = false
         resumeGame(resumeSpeed)
         if ok and result and result:sub(1, 3) == "OK:" then
-            if not quiet then say(player, getText("UI_SaveSlots_Saved", result:sub(4)), true) end
+            if quiet then
+                hudHide("saving")
+            else
+                hudShow("done", getText("UI_SaveSlots_Saved", result:sub(4)), 1, 2500)
+            end
             -- Saved in the game's Saves folder instead: say why, once.
             local text, bad = saveFolderText()
             if bad and not folderWarned then
                 folderWarned = true
-                say(player, text, false)
+                hudShow("error", text, nil, 7000)
             end
         else
-            say(player, errorText(ok and result or "ERR:unknown"), false)
+            hudShow("error", errorText(ok and result or "ERR:unknown"), nil, 6000)
         end
     end
-    local function waitForThumb()
-        if gone() then
+
+    --- Saves the game, waits for its picture (written by the render thread a
+    --- frame or more later), then runs step on a following tick.
+    local function saveThenWait(step)
+        local stampBefore = SaveSlotsJava.thumbStamp and SaveSlotsJava.thumbStamp() or nil
+        local saveStart = getTimestampMs()
+        saveGame()
+        saveGameMs = saveGameMs + (getTimestampMs() - saveStart)
+        local ticks = 0
+        local function waitForThumb()
+            if gone() then
+                tickEvent.Remove(waitForThumb)
+                abandon()
+                return
+            end
+            ticks = ticks + 1
+            if stampBefore ~= nil and ticks < THUMB_WAIT_TICKS and SaveSlotsJava.thumbStamp() == stampBefore then
+                return
+            end
             tickEvent.Remove(waitForThumb)
-            saving = false
-            return
+            -- One more tick so the render thread is surely done with the file.
+            local function nextTick()
+                tickEvent.Remove(nextTick)
+                step()
+            end
+            tickEvent.Add(nextTick)
         end
-        ticks = ticks + 1
-        if stampBefore ~= nil and ticks < THUMB_WAIT_TICKS and SaveSlotsJava.thumbStamp() == stampBefore then
-            return
-        end
-        tickEvent.Remove(waitForThumb)
-        -- One more tick so the render thread is surely done with the file.
-        tickEvent.Add(finish)
+        tickEvent.Add(waitForThumb)
     end
-    tickEvent.Add(waitForThumb)
+
+    --- Plain: the whole world is copied now, with the game stopped.
+    local function copyAtOnce()
+        if gone() then
+            abandon()
+            return
+        end
+        local ok, result = pcall(SaveSlotsJava.saveSlot, name, overwrite == true, info)
+        report(ok, result)
+    end
+
+    --- Smooth, last step: copy what changed while the world was being copied.
+    local function finishCopy()
+        if gone() then
+            abandon()
+            return
+        end
+        local ok, result = pcall(SaveSlotsJava.finishPrecopy)
+        report(ok, result)
+    end
+
+    --- Smooth: follow the copy in the background, then finish.
+    local function watchCopy()
+        local function poll()
+            if gone() then
+                tickEvent.Remove(poll)
+                abandon()
+                return
+            end
+            local status = SaveSlotsJava.precopyStatus() or ""
+            local done, total = status:match("^RUNNING:(%d+):(%d+)$")
+            if done then
+                if not quiet then
+                    local all = tonumber(total) or 0
+                    local fraction = all > 0 and math.min(0.99, tonumber(done) / all) or nil
+                    hudShow("saving", getText("UI_SaveSlots_Saving", name), fraction)
+                end
+                return
+            end
+            tickEvent.Remove(poll)
+            if status == "READY" then
+                -- No second saveGame(): it makes the game write most of the world again,
+                -- which would all have to be copied again. The copy is brought up to
+                -- date with what the game wrote meanwhile, which is the state the disk
+                -- would be in if the game stopped right now.
+                finishCopy()
+            else
+                -- It could not be copied in the background: do it the plain way.
+                print("[SaveSlots] Copy in the background did not work (" .. status .. "), copying at once")
+                copyAtOnce()
+            end
+        end
+        tickEvent.Add(poll)
+    end
+
+    local function startCopy()
+        if gone() then
+            abandon()
+            return
+        end
+        local ok, started = pcall(SaveSlotsJava.beginPrecopy, name, overwrite == true, info)
+        if not ok or started == nil then
+            copyAtOnce()
+        elseif started:sub(1, 3) == "OK:" then
+            report(true, started)   -- the slot being played was saved in place
+        elseif started == "STARTED" then
+            watchCopy()
+        else
+            copyAtOnce()            -- the plain way says what is wrong
+        end
+    end
+
+    --- The game stops while it saves, so this runs after the bar has been drawn.
+    local function begin()
+        tickEvent.Add(meterTick)
+        info = collectInfo()
+        if extraInfo then info = info .. "|" .. extraInfo end
+        saveThenWait(smooth and startCopy or copyAtOnce)
+    end
+
+    if quiet then
+        begin()
+        return
+    end
+    hudShow("saving", getText("UI_SaveSlots_Saving", name), nil)
+    local shownAt, frames = getTimestampMs(), 0
+    local function waitForBar()
+        if gone() then
+            tickEvent.Remove(waitForBar)
+            abandon()
+            return
+        end
+        frames = frames + 1
+        if frames < BAR_FRAMES or getTimestampMs() - shownAt < BAR_MS then return end
+        tickEvent.Remove(waitForBar)
+        begin()
+    end
+    tickEvent.Add(waitForBar)
 end
 
 --- Saves and quits to the main menu like the Esc menu's QUIT, then loads the save.
@@ -546,20 +857,27 @@ end
 -- stops while paused), and a long gap between ticks (alt-tab, loading) is not.
 local backupElapsedMs = 0
 local lastTickMs = nil
-local warnedAt = {}
+local warnShown = false
 Events.OnGameStart.Add(function()
     backupElapsedMs = 0
     lastTickMs = nil
-    warnedAt = {}
+    warnShown = false
 end)
 
 -- An Auto Backup is taken while the game is paused (Esc menu or the pause
 -- key), when nobody notices the short stop: from a minute before it is due.
--- If the player does not pause within 3 minutes after it is due, it is taken
--- while playing, after a 30 and 10 second warning and once no zombie is near.
+-- If the player does not pause within a few minutes after it is due (see
+-- waitMs), it is taken while playing, after a 30 and 10 second warning and
+-- once no zombie is near.
 local EARLY_MS = 60000
-local WAIT_MS = 3 * 60000
-local WARN_SECONDS = { 30, 10 }
+local WAIT_MAX_MS = 3 * 60000
+
+--- How long past the due time to wait for a quiet moment: up to 3 minutes, but
+--- never more than a fifth of the interval (a 10 minute interval waits 2).
+local function waitMs(interval)
+    return math.min(WAIT_MAX_MS, math.floor(interval / 5))
+end
+local WARN_MS = 30000
 -- Zombies this close (tiles, same floor) hold a backup while playing, unless
 -- it is this long overdue (a zombie stuck outside the base must not stop it).
 local ZOMBIE_RADIUS = 12
@@ -594,20 +912,22 @@ local function safeToBackup(player, overdue)
     return true
 end
 
---- "Auto Backup in 30 s" above the character, once per step.
+--- Countdown bar for the last 30 seconds before an Auto Backup taken while playing.
 local function warnBackup(player, msLeft)
-    if not (player and backupWarnOption:getValue()) then return end
-    for _, seconds in ipairs(WARN_SECONDS) do
-        if msLeft <= seconds * 1000 and msLeft > (seconds - 5) * 1000 and not warnedAt[seconds] then
-            warnedAt[seconds] = true
-            HaloTextHelper.addText(player, getText("UI_SaveSlots_BackupSoon", seconds))
-        end
+    local on = player and backupWarnOption:getValue()
+    if on and msLeft <= WARN_MS and msLeft > 0 then
+        warnShown = true
+        hudShow("warn", getText("UI_SaveSlots_BackupSoon", math.ceil(msLeft / 1000)), msLeft / WARN_MS)
+    elseif warnShown then
+        warnShown = false
+        hudHide("warn")
     end
 end
 
 local function runBackup()
     backupElapsedMs = 0
-    warnedAt = {}
+    warnShown = false
+    hudHide("warn")
     local ok, err = pcall(SaveSlots.autoBackup)
     if not ok then print("[SaveSlots] Auto Backup failed: " .. tostring(err)) end
 end
@@ -624,12 +944,17 @@ local function onBackupTick()
     local interval = backupIntervalMs()
     if interval <= 0 or saving then return end
     local player = getPlayer()
-    local deadline = interval + WAIT_MS
+    local deadline = interval + waitMs(interval)
     if backupElapsedMs < deadline then
         warnBackup(player, deadline - backupElapsedMs)
         return
     end
-    -- Not now: check again every second, so it happens as soon as it is safe.
+    -- Due: the countdown is over. Not now if it is not safe; check again every
+    -- second, so it happens as soon as it is.
+    if warnShown then
+        warnShown = false
+        hudHide("warn")
+    end
     if now - lastSafeCheckMs < SAFE_CHECK_MS then return end
     lastSafeCheckMs = now
     if safeToBackup(player, backupElapsedMs - deadline > OVERDUE_MS) then runBackup() end
@@ -651,7 +976,8 @@ if Events.OnTickEvenPaused then Events.OnTickEvenPaused.Add(onPausedBackupTick) 
 local function minutesToNextBackup()
     local interval = backupIntervalMs()
     if interval <= 0 then return nil end
-    return math.max(0, math.ceil((interval - backupElapsedMs) / 60000))
+    -- Second value: it is due and waiting for a quiet moment (not "0 min").
+    return math.max(0, math.ceil((interval - backupElapsedMs) / 60000)), backupElapsedMs >= interval
 end
 
 ----------------------------------------------------------------------------
@@ -906,8 +1232,10 @@ end
 function SaveSlotsDialog:prerender()
     ISPanel.prerender(self)
     local footer = getText("UI_SaveSlots_Footer", self.slotCount or 0, formatSize(self.totalSize or 0) or "0 MB")
-    local nextBackup = minutesToNextBackup()
-    if nextBackup then
+    local nextBackup, waiting = minutesToNextBackup()
+    if waiting then
+        footer = footer .. "  -  " .. getText("UI_SaveSlots_FooterAutoWaiting", formatSize(self.autoSize or 0) or "0 MB")
+    elseif nextBackup then
         footer = footer .. "  -  " .. getText("UI_SaveSlots_FooterAuto", formatSize(self.autoSize or 0) or "0 MB", nextBackup)
     else
         footer = footer .. "  -  " .. getText("UI_SaveSlots_FooterAutoOff")

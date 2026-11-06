@@ -7,6 +7,7 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
@@ -24,8 +25,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
@@ -185,6 +188,9 @@ public class SaveSlotsApi {
      * when overwrite is true. info ("key=value|...") is stored with the slot.
      */
     public static String saveSlot(String slotName, boolean overwrite, String info) {
+        if (precopyBusy()) {
+            return "ERR:busy";
+        }
         String problem = checkCanSave();
         if (problem != null) {
             return problem;
@@ -228,105 +234,460 @@ public class SaveSlotsApi {
         return saveSlotAt(current, folder, folder, work, slotName, overwrite, info);
     }
 
+    /**
+     * Where a copy goes and what it replaces, decided before copying. done is
+     * set when there is nothing to copy: an error, or the slot being played.
+     */
+    static final class SavePlan {
+        Path current, folder, look, work, targetWork, parent, target, existing, fresh, old;
+        String base, clean, info;
+        String done;
+    }
+
     /** look: where existing slots are looked for besides Saves (the unticked folder too). */
-    static String saveSlotAt(Path current, Path folder, Path look, Path work, String slotName, boolean overwrite,
+    static SavePlan planSave(Path current, Path folder, Path look, Path work, String slotName, boolean overwrite,
             String info) {
-        String clean = sanitize(slotName);
-        if (clean.isEmpty()) {
-            return "ERR:empty_name";
+        SavePlan p = new SavePlan();
+        p.current = current;
+        p.folder = folder;
+        p.look = look;
+        p.work = work;
+        p.info = info;
+        p.clean = sanitize(slotName);
+        if (p.clean.isEmpty()) {
+            p.done = "ERR:empty_name";
+            return p;
         }
-        String base = baseWorldName(current);
-        Path inSaves = current.resolveSibling(base + SEPARATOR + clean).normalize();
-        Path parent = slotParent(current, folder);
-        Path target = parent.resolve(base + SEPARATOR + clean).normalize();
-        if (!inSaves.getParent().equals(current.getParent()) || !target.getParent().equals(parent)) {
-            return "ERR:bad_name";
+        p.base = baseWorldName(current);
+        Path inSaves = current.resolveSibling(p.base + SEPARATOR + p.clean).normalize();
+        p.parent = slotParent(current, folder);
+        p.target = p.parent.resolve(p.base + SEPARATOR + p.clean).normalize();
+        if (!inSaves.getParent().equals(current.getParent()) || !p.target.getParent().equals(p.parent)) {
+            p.done = "ERR:bad_name";
+            return p;
         }
 
         // Playing this very slot: saveGame() already wrote it.
         if (inSaves.equals(current)) {
-            writeMarker(current, base);
+            writeMarker(current, p.base);
             writeInfo(current, info, -1);
-            return "OK:" + clean;
+            p.done = "OK:" + p.clean;
+            return p;
         }
 
-        if (Files.exists(target) && slotNameOf(target, base) == null) {
-            return "ERR:foreign:" + target.getFileName();
+        if (Files.exists(p.target) && slotNameOf(p.target, p.base) == null) {
+            p.done = "ERR:foreign:" + p.target.getFileName();
+            return p;
         }
         // The slot as it is now, in the chosen folder or still in Saves.
-        Path existing = findSlot(current, look != null ? look : folder, base, clean);
-        if (existing != null && !overwrite) {
-            return "ERR:exists:" + clean;
+        p.existing = findSlot(current, look != null ? look : folder, p.base, p.clean);
+        if (p.existing != null && !overwrite) {
+            p.done = "ERR:exists:" + p.clean;
+            return p;
         }
 
         // Built on the same drive as the target, so it can be swapped in with a rename.
-        Path targetWork = work;
+        p.targetWork = work;
         if (folder != null) {
             try {
-                targetWork = prepareWorkDir(folder.resolve(FOLDER_WORK));
+                p.targetWork = prepareWorkDir(folder.resolve(FOLDER_WORK));
             } catch (IOException e) {
-                return "ERR:io:" + e.getMessage();
+                p.done = "ERR:io:" + e.getMessage();
+                return p;
             }
         }
         long stamp = System.nanoTime();
-        Path fresh = targetWork.resolve("new-" + stamp);
-        Path old = targetWork.resolve("old-" + stamp);
+        p.fresh = p.targetWork.resolve("new-" + stamp);
+        p.old = p.targetWork.resolve("old-" + stamp);
+        return p;
+    }
 
+    /**
+     * The previous copy of this slot, for linking the files that did not
+     * change to it instead of copying them. That copy is deleted right after
+     * the swap, so no file stays shared between two saves: a save opened
+     * without the mod is written in place and must not change another.
+     */
+    private static Path linkSourceOf(SavePlan p) {
+        return p.existing != null && canLink(p.existing) ? p.existing : null;
+    }
+
+    /** look: where existing slots are looked for besides Saves (the unticked folder too). */
+    static String saveSlotAt(Path current, Path folder, Path look, Path work, String slotName, boolean overwrite,
+            String info) {
+        SavePlan p = planSave(current, folder, look, work, slotName, overwrite, info);
+        if (p.done != null) {
+            return p.done;
+        }
+        CopyStats stats;
         try {
-            // Files unchanged since the previous copy of this slot are linked
-            // to it instead of copied. That copy is deleted right after the
-            // swap, so no file stays shared between two saves: a save opened
-            // without the mod is written in place and must not change another.
-            CopyStats stats = copyRecursively(current, fresh, existing != null && canLink(existing) ? existing : null);
-            writeMarkerOrThrow(fresh, base);
-            writeInfo(fresh, info, stats.bytes);
-            Files.createDirectories(parent);
+            stats = copyRecursively(current, p.fresh, linkSourceOf(p));
+        } catch (IOException e) {
+            deleteQuietly(p.fresh);
+            System.out.println("[SaveSlots] Copy failed, nothing changed: " + e);
+            return "ERR:io:" + e.getMessage();
+        }
+        return commitSave(p, stats);
+    }
+
+    /** Marks the new copy, swaps it in for the slot it replaces and removes the old one. */
+    static String commitSave(SavePlan p, CopyStats stats) {
+        try {
+            writeMarkerOrThrow(p.fresh, p.base);
+            writeInfo(p.fresh, p.info, stats.bytes);
+            Files.createDirectories(p.parent);
             System.out.println("[SaveSlots] Copied " + stats);
         } catch (IOException e) {
-            deleteQuietly(fresh);
+            deleteQuietly(p.fresh);
             System.out.println("[SaveSlots] Copy failed, nothing changed: " + e);
             return "ERR:io:" + e.getMessage();
         }
 
         try {
-            if (target.equals(existing)) {
-                Files.move(target, old, StandardCopyOption.ATOMIC_MOVE);
+            if (p.target.equals(p.existing)) {
+                Files.move(p.target, p.old, StandardCopyOption.ATOMIC_MOVE);
                 try {
-                    Files.move(fresh, target, StandardCopyOption.ATOMIC_MOVE);
+                    Files.move(p.fresh, p.target, StandardCopyOption.ATOMIC_MOVE);
                 } catch (IOException e) {
                     // Put the previous slot back before reporting the error.
-                    Files.move(old, target, StandardCopyOption.ATOMIC_MOVE);
+                    Files.move(p.old, p.target, StandardCopyOption.ATOMIC_MOVE);
                     throw e;
                 }
-                discard(targetWork, old);
+                discard(p.targetWork, p.old);
             } else {
                 // The game menu's link to a copy elsewhere: the new copy takes its place.
-                if (isLink(target)) {
-                    Files.delete(target);
+                if (isLink(p.target)) {
+                    Files.delete(p.target);
                 }
-                Files.move(fresh, target, StandardCopyOption.ATOMIC_MOVE);
+                Files.move(p.fresh, p.target, StandardCopyOption.ATOMIC_MOVE);
             }
         } catch (IOException e) {
-            deleteQuietly(fresh);
+            deleteQuietly(p.fresh);
             System.out.println("[SaveSlots] Swap failed, previous slot kept: " + e);
             return "ERR:io:" + e.getMessage();
         }
-        if (existing != null && !existing.equals(target)) {
+        if (p.existing != null && !p.existing.equals(p.target)) {
             // It was in the other place (Saves or the save folder): the new copy replaces it.
             try {
-                Path folderOfExisting = look != null && existing.startsWith(look) ? look : null;
-                trash(existing, folderOfExisting != null ? prepareWorkDir(folderOfExisting.resolve(FOLDER_WORK)) : work);
+                Path folderOfExisting = p.look != null && p.existing.startsWith(p.look) ? p.look : null;
+                trash(p.existing,
+                        folderOfExisting != null ? prepareWorkDir(folderOfExisting.resolve(FOLDER_WORK)) : p.work);
             } catch (IOException e) {
-                System.out.println("[SaveSlots] Could not remove the previous copy " + existing + ": " + e);
+                System.out.println("[SaveSlots] Could not remove the previous copy " + p.existing + ": " + e);
             }
         }
 
-        System.out.println("[SaveSlots] Saved slot \"" + clean + "\" from " + current + " to " + target);
-        return "OK:" + clean;
+        System.out.println("[SaveSlots] Saved slot \"" + p.clean + "\" from " + p.current + " to " + p.target);
+        return "OK:" + p.clean;
+    }
+
+    // ---------------------------------------------------------------------
+    // Copy in the background, then bring it up to date.
+    //
+    // The game writes the world all the time it runs, so a copy made while it
+    // runs is a mix of moments. This copies in two steps: (1) the whole world
+    // on a background thread, noting what every file looked like (size and
+    // time) just before it was copied, while the game runs on; (2) with the
+    // game stopped for a moment, only the files that differ from those notes
+    // are copied again, and checked again until nothing differs. The stop
+    // lasts as long as the changes of step 1 take to copy, not the whole world.
+    // If the world will not settle, the old way is used: copy it all at once.
+    // ---------------------------------------------------------------------
+
+    /** Passes of copying changed files, with the game stopped, before giving up and copying everything. */
+    private static final int DELTA_PASSES = 3;
+
+    private static final ExecutorService copier = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "SaveSlots-copy");
+        t.setDaemon(true);
+        t.setPriority(Thread.NORM_PRIORITY - 1);
+        return t;
+    });
+
+    /** A copy of the world being made while the game runs. */
+    static final class Precopy {
+        final SavePlan plan;
+        /** What each source file looked like ("size:time") just before it was copied. */
+        final Map<String, String> seen = new ConcurrentHashMap<>();
+        volatile long bytesDone, bytesTotal;
+        volatile boolean ready, cancelled;
+        volatile String error;
+        Future<?> job;
+
+        Precopy(SavePlan plan) {
+            this.plan = plan;
+        }
+    }
+
+    private static volatile Precopy precopy = null;
+
+    // Tests only: holds the background copy back, and plays the part of the game
+    // writing files while the copy is brought up to date (called with the pass number).
+    static volatile CountDownLatch precopyGate = null;
+    static volatile java.util.function.IntConsumer deltaHook = null;
+
+    static volatile boolean skipFlushForTest = false;
+
+    private static boolean precopyBusy() {
+        return precopy != null;
+    }
+
+    /** Tests only: bytes copied and in all of the copy being made, "done/total". */
+    static String precopyProgress() {
+        Precopy p = precopy;
+        return p == null ? "" : p.bytesDone + "/" + p.bytesTotal;
+    }
+
+    private static String stampOf(BasicFileAttributes attrs) {
+        return attrs.size() + ":" + attrs.lastModifiedTime().toMillis();
+    }
+
+    /**
+     * Starts copying the world being played on a background thread. Call
+     * saveGame() first. Returns "STARTED", or "ERR:..." (or "OK:<name>" when
+     * the slot being played was saved in place). Then ask precopyStatus().
+     */
+    public static String beginPrecopy(String slotName, boolean overwrite, String info) {
+        if (precopyBusy()) {
+            return "ERR:busy";
+        }
+        String problem = checkCanSave();
+        if (problem != null) {
+            return problem;
+        }
+        Path work;
+        try {
+            work = workDir();
+        } catch (IOException e) {
+            return "ERR:io:" + e.getMessage();
+        }
+        return beginPrecopyAt(currentSave(), usableSaveFolder(), knownFolder(), work, slotName, overwrite, info);
+    }
+
+    static String beginPrecopyAt(Path current, Path folder, Path look, Path work, String slotName,
+            boolean overwrite, String info) {
+        if (precopyBusy()) {
+            return "ERR:busy";
+        }
+        SavePlan plan = planSave(current, folder, look, work, slotName, overwrite, info);
+        if (plan.done != null) {
+            return plan.done;
+        }
+        Precopy p = new Precopy(plan);
+        precopy = p;
+        p.job = copier.submit(() -> runPrecopy(p));
+        return "STARTED";
+    }
+
+    private static void runPrecopy(Precopy p) {
+        try {
+            CountDownLatch gate = precopyGate;
+            if (gate != null) {
+                gate.await();
+            }
+            p.bytesTotal = folderSize(p.plan.current);
+            copyRecursively(p.plan.current, p.plan.fresh, linkSourceOf(p.plan), new CopyWatcher() {
+                @Override
+                public void before(String rel, BasicFileAttributes attrs) {
+                    p.seen.put(rel, stampOf(attrs));
+                }
+
+                @Override
+                public void copied(long bytes) {
+                    p.bytesDone += bytes;
+                }
+
+                @Override
+                public boolean cancelled() {
+                    return p.cancelled;
+                }
+            });
+            if (p.cancelled) {
+                deleteLater(p.plan.fresh);
+                return;
+            }
+            p.ready = true;
+        } catch (IOException | RuntimeException | InterruptedException e) {
+            System.out.println("[SaveSlots] Copying in the background failed: " + e);
+            deleteLater(p.plan.fresh);
+            if (!p.cancelled) {
+                p.error = String.valueOf(e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * "" if no copy is being made, "RUNNING:<bytes copied>:<bytes in all>",
+     * "READY" (call finishPrecopy), or "ERR:io:<why>" (said once; then it is over).
+     */
+    public static String precopyStatus() {
+        Precopy p = precopy;
+        if (p == null) {
+            return "";
+        }
+        if (p.error != null) {
+            precopy = null;
+            return "ERR:io:" + p.error;
+        }
+        if (p.ready) {
+            return "READY";
+        }
+        return "RUNNING:" + p.bytesDone + ":" + p.bytesTotal;
+    }
+
+    /**
+     * Stops the copy and removes it. Used when the player leaves the game
+     * while it runs. The slot that was to be replaced is not touched.
+     */
+    public static void cancelPrecopy() {
+        Precopy p = precopy;
+        if (p == null) {
+            return;
+        }
+        p.cancelled = true;
+        try {
+            p.job.get(5, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            System.out.println("[SaveSlots] The background copy did not stop in time: " + e);
+        }
+        deleteLater(p.plan.fresh);
+        precopy = null;
+    }
+
+    /**
+     * The last step, with the game stopped: copies the files that changed
+     * since they were noted, until none does, then swaps the copy in. The copy
+     * is the world as the game has left it on disk (what a crash right now
+     * would leave), not a new saveGame(): that makes the game write most of
+     * the world again, all of which would be copied again. Returns
+     * "OK:<name>" or "ERR:...";
+     */
+    public static String finishPrecopy() {
+        Precopy p = precopy;
+        if (p == null) {
+            return "ERR:no_copy";
+        }
+        try {
+            if (p.error != null || !p.ready) {
+                deleteLater(p.plan.fresh);
+                return "ERR:not_ready";
+            }
+            return finishPrecopyAt(p);
+        } finally {
+            precopy = null;
+        }
+    }
+
+    static String finishPrecopyAt(Precopy p) {
+        SavePlan plan = p.plan;
+        long start = System.currentTimeMillis();
+        if (!skipFlushForTest && !flushChunks()) {
+            deleteLater(plan.fresh);
+            return "ERR:chunks_busy";
+        }
+        long flushMs = System.currentTimeMillis() - start;
+        int passes = 0;
+        long changedFiles = 0;
+        long changedBytes = 0;
+        try {
+            while (true) {
+                List<String> changed = new ArrayList<>();
+                List<String> removed = new ArrayList<>();
+                changesSince(plan.current, p.seen, changed, removed);
+                if (changed.isEmpty() && removed.isEmpty()) {
+                    break;
+                }
+                if (passes >= DELTA_PASSES) {
+                    System.out.println("[SaveSlots] The world kept changing, copying it all again at once");
+                    deleteQuietly(plan.fresh);
+                    return saveSlotAt(plan.current, plan.folder, plan.look, plan.work, plan.clean,
+                            plan.existing != null, plan.info);
+                }
+                for (String rel : removed) {
+                    p.seen.remove(rel);
+                    Files.deleteIfExists(plan.fresh.resolve(rel));
+                }
+                for (String rel : changed) {
+                    changedBytes += copyChanged(plan.current, plan.fresh, rel, p.seen);
+                }
+                changedFiles += changed.size();
+                passes++;
+                java.util.function.IntConsumer hook = deltaHook;
+                if (hook != null) {
+                    hook.accept(passes);
+                }
+            }
+        } catch (IOException | RuntimeException e) {
+            deleteQuietly(plan.fresh);
+            System.out.println("[SaveSlots] Bringing the copy up to date failed, nothing changed: " + e);
+            return "ERR:io:" + e.getMessage();
+        }
+        CopyStats stats = new CopyStats();
+        stats.files = p.seen.size();
+        stats.bytes = folderSize(plan.fresh);
+        stats.millis = System.currentTimeMillis() - start;
+        lastCopy = stats;
+        System.out.println("[SaveSlots] Brought up to date in " + stats.millis + " ms (waiting for the game's own writes "
+                + flushMs + " ms; " + changedFiles + " files, " + (changedBytes / 1024) + " KB copied again in "
+                + passes + " passes)");
+        return commitSave(plan, stats);
+    }
+
+    /** Files of source that are new or differ from the notes, and notes of files that are gone. */
+    static void changesSince(Path source, Map<String, String> seen, List<String> changed, List<String> removed)
+            throws IOException {
+        Set<String> present = new HashSet<>();
+        Files.walkFileTree(source, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                String rel = source.relativize(file).toString();
+                present.add(rel);
+                if (!stampOf(attrs).equals(seen.get(rel))) {
+                    changed.add(rel);
+                }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFileFailed(Path file, IOException e) {
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        for (String rel : seen.keySet()) {
+            if (!present.contains(rel)) {
+                removed.add(rel);
+            }
+        }
+    }
+
+    /**
+     * Copies one file of the world into the copy, replacing what is there.
+     * The old file is deleted first: it may be a hard link to the slot being
+     * replaced, and writing through it would change that slot. Returns the
+     * bytes copied.
+     */
+    private static long copyChanged(Path source, Path target, String rel, Map<String, String> seen)
+            throws IOException {
+        Path src = source.resolve(rel);
+        Path dst = target.resolve(rel);
+        try {
+            seen.put(rel, stampOf(Files.readAttributes(src, BasicFileAttributes.class)));
+            Files.createDirectories(dst.getParent());
+            Files.deleteIfExists(dst);
+            Files.copy(src, dst, StandardCopyOption.COPY_ATTRIBUTES);
+            return Files.size(dst);
+        } catch (NoSuchFileException e) {
+            seen.remove(rel);   // gone meanwhile; the next check finds it removed
+            Files.deleteIfExists(dst);
+            return 0;
+        }
     }
 
     /** Renames a slot of the world being played. The slot being played cannot be renamed. */
     public static String renameSlot(String oldName, String newName) {
+        if (precopyBusy()) {
+            return "ERR:busy";
+        }
         if (!isAvailable()) {
             return "ERR:multiplayer";
         }
@@ -380,6 +741,9 @@ public class SaveSlotsApi {
 
     /** Deletes a slot of the world being played. The slot being played and the main world cannot be deleted. */
     public static String deleteSlot(String slotName) {
+        if (precopyBusy()) {
+            return "ERR:busy";
+        }
         if (!isAvailable()) {
             return "ERR:multiplayer";
         }
@@ -497,6 +861,8 @@ public class SaveSlotsApi {
         if (!isAvailable()) {
             return "ERR:multiplayer";
         }
+        // A copy still being made of the world that is about to be replaced: stop it.
+        cancelPrecopy();
         Path slot = savePath(relativeSave);
         if (slot == null) {
             return "ERR:not_found:" + relativeSave;
@@ -1245,6 +1611,26 @@ public class SaveSlotsApi {
      * instead of copied. If a link cannot be made, the rest is copied.
      */
     static CopyStats copyRecursively(Path source, Path target, Path linkFrom) throws IOException {
+        return copyRecursively(source, target, linkFrom, null);
+    }
+
+    /** Hooks for a copy of the world that is made while the game runs (see Precopy). */
+    interface CopyWatcher {
+        /** Called before each file is copied, with how it looks right now. */
+        void before(String rel, BasicFileAttributes attrs);
+
+        /** Called after each file, with its size. */
+        void copied(long bytes);
+
+        boolean cancelled();
+    }
+
+    /**
+     * With a watcher, the world may change while it is copied: a file that
+     * vanishes is skipped, and the copy stops when the watcher says so.
+     */
+    static CopyStats copyRecursively(Path source, Path target, Path linkFrom, CopyWatcher watcher)
+            throws IOException {
         CopyStats stats = new CopyStats();
         long start = System.currentTimeMillis();
         boolean[] linking = { linkFrom != null };
@@ -1256,9 +1642,28 @@ public class SaveSlotsApi {
             }
 
             @Override
+            public FileVisitResult visitFileFailed(Path file, IOException e) throws IOException {
+                if (watcher != null && e instanceof NoSuchFileException) {
+                    return FileVisitResult.CONTINUE;   // gone while we were copying
+                }
+                throw e;
+            }
+
+            @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
                 String rel = source.relativize(file).toString();
                 Path copy = target.resolve(rel);
+                if (watcher != null) {
+                    if (watcher.cancelled()) {
+                        return FileVisitResult.TERMINATE;
+                    }
+                    try {
+                        attrs = Files.readAttributes(file, BasicFileAttributes.class);
+                    } catch (NoSuchFileException e) {
+                        return FileVisitResult.CONTINUE;
+                    }
+                    watcher.before(rel, attrs);
+                }
                 stats.files++;
                 stats.bytes += attrs.size();
                 // The marker and info files are rewritten after the copy, so they are never linked.
@@ -1271,6 +1676,9 @@ public class SaveSlotsApi {
                         Files.createLink(copy, linkFrom.resolve(rel));
                         stats.linkedFiles++;
                         stats.linkedBytes += attrs.size();
+                        if (watcher != null) {
+                            watcher.copied(attrs.size());
+                        }
                         return FileVisitResult.CONTINUE;
                     } catch (IOException | UnsupportedOperationException e) {
                         System.out.println("[SaveSlots] Hard links not possible here, copying instead: " + e);
@@ -1278,7 +1686,18 @@ public class SaveSlotsApi {
                         Files.deleteIfExists(copy);
                     }
                 }
-                Files.copy(file, copy, StandardCopyOption.COPY_ATTRIBUTES);
+                try {
+                    Files.copy(file, copy, StandardCopyOption.COPY_ATTRIBUTES);
+                } catch (NoSuchFileException e) {
+                    if (watcher == null) {
+                        throw e;
+                    }
+                    Files.deleteIfExists(copy);   // gone while we were copying it
+                    return FileVisitResult.CONTINUE;
+                }
+                if (watcher != null) {
+                    watcher.copied(attrs.size());
+                }
                 return FileVisitResult.CONTINUE;
             }
         });
